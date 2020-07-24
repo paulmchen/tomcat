@@ -1,10 +1,16 @@
-#!/bin/bash
-set -eo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s nullglob
 
 # docker run -it --rm buildpack-deps:curl
 # curl -fsSL 'https://www.apache.org/dist/tomcat/tomcat-8/KEYS' | gpg --import
 # gpg --fingerprint | grep 'Key fingerprint =' | cut -d= -f2 | sed -r 's/ +//g' | sort
 declare -A gpgKeys=(
+	# gpg: key 10C01C5A2F6059E7: public key "Mark E D Thomas <markt@apache.org>" imported
+	[10]='
+		A9C5DF4D22E99998D9875A5110C01C5A2F6059E7
+	'
+
 	# gpg: key F22C4FED: public key "Andy Armstrong <andy@tagish.com>" imported
 	# gpg: key 86867BA6: public key "Jean-Frederic Clere (jfclere) <JFrederic.Clere@fujitsu-siemens.com>" imported
 	# gpg: key E86E29AC: public key "kevin seguin <seguin@apache.org>" imported
@@ -102,10 +108,9 @@ if [ ${#versions[@]} -eq 0 ]; then
 fi
 versions=( "${versions[@]%/}" )
 
-# see OPENSSL_VERSION in Dockerfile.template
-opensslVersionDebian="$(docker run -i --rm debian:stretch-slim bash -c 'apt-get update -qq && apt-cache show "$@"' -- 'openssl' |tac|tac| awk -F ': ' '$1 == "Version" { print $2; exit }')"
+# sort version numbers with lowest first
+IFS=$'\n'; versions=( $(sort -V <<<"${versions[*]}") ); unset IFS
 
-travisEnv=
 for version in "${versions[@]}"; do
 	majorVersion="${version%%.*}"
 
@@ -115,52 +120,89 @@ for version in "${versions[@]}"; do
 		exit 1
 	fi
 
-	fullVersion="$(
+	possibleVersions="$(
 		curl -fsSL --compressed "https://www-us.apache.org/dist/tomcat/tomcat-$majorVersion/" \
 			| grep '<a href="v'"$version." \
 			| sed -r 's!.*<a href="v([^"/]+)/?".*!\1!' \
-			| sort -V \
-			| tail -1
+			| sort -rV
 	)"
+	fullVersion=
+	sha512=
+	for possibleVersion in $possibleVersions; do
+		if possibleSha512="$(
+			curl -fsSL "https://www-us.apache.org/dist/tomcat/tomcat-$majorVersion/v$possibleVersion/bin/apache-tomcat-$possibleVersion.tar.gz.sha512" \
+				| cut -d' ' -f1
+		)" && [ -n "$possibleSha512" ]; then
+			fullVersion="$possibleVersion"
+			sha512="$possibleSha512"
+			break
+		fi
+	done
+	if [ -z "$fullVersion" ]; then
+		echo >&2 "error: failed to find latest release for $version"
+		exit 1
+	fi
 
-	sha1="$(
-		curl -fsSL "https://www-us.apache.org/dist/tomcat/tomcat-$majorVersion/v$fullVersion/bin/apache-tomcat-$fullVersion.tar.gz.sha1" \
-			| cut -d' ' -f1
-	)"
+	echo "$version: $fullVersion ($sha512)"
 
-	for variant in "$version"/*/; do
-		variant="$(basename "$variant")"
-		javaVariant="${variant%%-*}"
-		subVariant="${variant#$javaVariant-}"
-		[ "$subVariant" != "$variant" ] || subVariant=
+	for javaDir in "$version"/{jre,jdk}{8,11,14}/; do
+		javaDir="${javaDir%/}"
+		javaVariant="$(basename "$javaDir")"
+		javaVersion="${javaVariant#jdk}"
+		javaVersion="${javaVersion#jre}" # "11", "8"
+		javaVariant="${javaVariant%$javaVersion}" # "jdk", "jre"
+		# all variants in reverse alphabetical order followed by OpenJDK
+		for vendorDir in "$javaDir"/{corretto,adoptopenjdk-{openj9,hotspot},openjdk{-slim,{-slim,}-buster,-oracle,}}/; do
+			vendorDir="${vendorDir%/}"
+			vendor="$(basename "$vendorDir")"
+			[ -d "$vendorDir" ] || continue
 
-		baseImage='openjdk'
-		case "$javaVariant" in
-			jre*|jdk*)
-				baseImage+=":${javaVariant:3}-${javaVariant:0:3}${subVariant:+-$subVariant}" # ":7-jre" or ":7-jre-alpine"
-				;;
-			*)
-				echo >&2 "not sure what to do with $version/$variant re: baseImage; skipping"
-				continue
-				;;
-		esac
+			template=
+			baseImage=
+			case "$vendor" in
+				openjdk | openjdk-slim | openjdk*-buster)
+					template='apt'
+					baseImage="openjdk:$javaVersion-$javaVariant"
+					if vendorVariant="${vendor#openjdk-}" && [ "$vendorVariant" != "$vendor" ]; then
+						baseImage+="-$vendorVariant"
+					fi
+					;;
+				openjdk-oracle)
+					template='yum'
+					baseImage="openjdk:$javaVersion-$javaVariant-oracle"
+					;;
 
-		(
-			set -x
-			cp -v "Dockerfile${subVariant:+-$subVariant}.template" "$version/$variant/Dockerfile"
-			sed -ri \
+				adoptopenjdk-hotspot | adoptopenjdk-openj9)
+					template='apt'
+					adoptVariant="${vendor#adoptopenjdk-}"
+					baseImage="adoptopenjdk:$javaVersion-$javaVariant-$adoptVariant"
+					;;
+
+				corretto)
+					template='yum'
+					baseImage="amazoncorretto:$javaVersion"
+					;;
+			esac
+
+			if [ -z "$template" ]; then
+				echo >&2 "error: cannot determine template for '$vendorDir'"
+				exit 1
+			fi
+			if [ -z "$baseImage" ]; then
+				echo >&2 "error: cannot determine base image for '$vendorDir'"
+				exit 1
+			fi
+
+			echo "  - $vendorDir: $baseImage ($template)"
+
+			sed -r \
 				-e 's/^(ENV TOMCAT_VERSION) .*/\1 '"$fullVersion"'/' \
 				-e 's/^(FROM) .*/\1 '"$baseImage"'/' \
-				-e 's/^(ENV OPENSSL_VERSION) .*/\1 '"${opensslVersionDebian}"'/' \
 				-e 's/^(ENV TOMCAT_MAJOR) .*/\1 '"$majorVersion"'/' \
-				-e 's/^(ENV TOMCAT_SHA1) .*/\1 '"$sha1"'/' \
+				-e 's/^(ENV TOMCAT_SHA512) .*/\1 '"$sha512"'/' \
 				-e 's/^(ENV GPG_KEYS) .*/\1 '"${versionGpgKeys[*]}"'/' \
-				"$version/$variant/Dockerfile"
-		)
-
-		travisEnv='\n  - '"VERSION=$version VARIANT=$variant$travisEnv"
+				"Dockerfile-$template.template" \
+				> "$vendorDir/Dockerfile"
+		done
 	done
 done
-
-travis="$(awk -v 'RS=\n\n' '$1 == "env:" { $0 = "env:'"$travisEnv"'" } { printf "%s%s", $0, RS }' .travis.yml)"
-echo "$travis" > .travis.yml
