@@ -14,8 +14,8 @@ ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$TOMCAT_NATIVE_LIBDIR
 ENV GPG_KEYS 05AB33110949707C93A279E3D3EFE6B686867BA6 07E48665A34DCAFAE522E5E6266191C37C037D42 47309207D818FFD8DCD3F83F1931D684307A10A5 541FBE7D8F78B25E055DDEE13C370389288584E7 61B832AC2F1C5A90F0F9B00A1C506407564C17A3 713DA88BE50911535FE716F5208B0AB1D63011C7 79F7026C690BAA50B92CD8B66A3AD3F4F22C4FED 9BA44C2621385CB966EBA586F72C284D731FABEE A27677289986DB50844682F8ACB77FC2E86E29AC A9C5DF4D22E99998D9875A5110C01C5A2F6059E7 DCFD35E0BF8CA7344752DE8B6FB21E8933C60243 F3A04C595DB5B6A5F1ECA43E3B7BBB100D811BBE F7DA48BB64BCB84ECBA7EE6935CD23C10D498E23
 
 ENV TOMCAT_MAJOR 7
-ENV TOMCAT_VERSION 7.0.106
-ENV TOMCAT_SHA512 f1fb2f3db9e66e66df120b058c216e72ec30df90abd80feda49773fa35c3c00cb56e4d264803696e1a71591d5cb60fcabf60f37e1774d549642ebe3eb902622d
+ENV TOMCAT_VERSION 7.0.109
+ENV TOMCAT_SHA512 612e830913bf1401bc9540e2273e465b0ee7ef63750a9969a80f1e9da9edb4888aa621fcc6fa5ba23cff94a40e91eb97e3f969b8064dabd49b2d0ea29e59b57e
 
 RUN set -eux; \
 	\
@@ -42,7 +42,7 @@ RUN set -eux; \
 # if all else fails, let's try Maven (https://www.mail-archive.com/users@tomcat.apache.org/msg134940.html; https://mvnrepository.com/artifact/org.apache.tomcat/tomcat; https://repo1.maven.org/maven2/org/apache/tomcat/tomcat/)
 			${mvnFile:+"https://repo1.maven.org/maven2/org/apache/tomcat/tomcat/$mvnFile"} \
 		; do \
-			if wget -O "$f" "$distUrl" && [ -s "$f" ]; then \
+			if wget -O "$f" "$distUrl" --progress=dot:giga && [ -s "$f" ]; then \
 				success=1; \
 				break; \
 			fi; \
@@ -101,8 +101,9 @@ RUN set -eux; \
 	[ -z "$savedAptMark" ] || apt-mark manual $savedAptMark > /dev/null; \
 	find "$TOMCAT_NATIVE_LIBDIR" -type f -executable -exec ldd '{}' ';' \
 		| awk '/=>/ { print $(NF-1) }' \
+		| xargs -rt readlink -e \
 		| sort -u \
-		| xargs -r dpkg-query --search \
+		| xargs -rt dpkg-query --search \
 		| cut -d: -f1 \
 		| sort -u \
 		| xargs -r apt-mark manual \
@@ -117,14 +118,17 @@ RUN set -eux; \
 # fix permissions (especially for running as non-root)
 # https://github.com/docker-library/tomcat/issues/35
 	chmod -R +rX .; \
-	chmod 777 logs temp work
+	chmod 777 logs temp work; \
+	\
+# smoke test
+	catalina.sh version
 
 # verify Tomcat Native is working properly
-RUN set -e \
-	&& nativeLines="$(catalina.sh configtest 2>&1)" \
-	&& nativeLines="$(echo "$nativeLines" | grep 'Apache Tomcat Native')" \
-	&& nativeLines="$(echo "$nativeLines" | sort -u)" \
-	&& if ! echo "$nativeLines" | grep -E 'INFO: Loaded( APR based)? Apache Tomcat Native library' >&2; then \
+RUN set -eux; \
+	nativeLines="$(catalina.sh configtest 2>&1)"; \
+	nativeLines="$(echo "$nativeLines" | grep 'Apache Tomcat Native')"; \
+	nativeLines="$(echo "$nativeLines" | sort -u)"; \
+	if ! echo "$nativeLines" | grep -E 'INFO: Loaded( APR based)? Apache Tomcat Native library' >&2; then \
 		echo >&2 "$nativeLines"; \
 		exit 1; \
 	fi

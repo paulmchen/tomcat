@@ -14,8 +14,8 @@ ENV LD_LIBRARY_PATH ${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$TOMCAT_NATIVE_LIBDIR
 ENV GPG_KEYS A9C5DF4D22E99998D9875A5110C01C5A2F6059E7
 
 ENV TOMCAT_MAJOR 10
-ENV TOMCAT_VERSION 10.0.0-M9
-ENV TOMCAT_SHA512 547ae280792b8684d11154f678584d0c4eb5af645cc8145e04da6de6d115b7bca03122191e6447cdb3497b85357181ca3fd9716d8a2dbc86461cf28f3df3ee91
+ENV TOMCAT_VERSION 10.0.6
+ENV TOMCAT_SHA512 3d39b086b6fec86e354aa4837b1b55e6c16bfd5ec985a82a5dd71f928e3fab5370b2964a5a1098cfe05ca63d031f198773b18b1f8c7c6cdee6c90aa0644fb2f2
 
 RUN set -eux; \
 	\
@@ -115,8 +115,9 @@ RUN set -eux; \
 	deps="$( \
 		find "$TOMCAT_NATIVE_LIBDIR" -type f -executable -exec ldd '{}' ';' \
 			| awk '/=>/ && $(NF-1) != "=>" { print $(NF-1) }' \
+			| xargs -rt readlink -e \
 			| sort -u \
-			| xargs -r rpm --query --whatprovides \
+			| xargs -rt rpm --query --whatprovides \
 			| sort -u \
 	)"; \
 	[ -z "$deps" ] || yumdb set reason user $deps; \
@@ -133,14 +134,17 @@ RUN set -eux; \
 # fix permissions (especially for running as non-root)
 # https://github.com/docker-library/tomcat/issues/35
 	chmod -R +rX .; \
-	chmod 777 logs temp work
+	chmod 777 logs temp work; \
+	\
+# smoke test
+	catalina.sh version
 
 # verify Tomcat Native is working properly
-RUN set -e \
-	&& nativeLines="$(catalina.sh configtest 2>&1)" \
-	&& nativeLines="$(echo "$nativeLines" | grep 'Apache Tomcat Native')" \
-	&& nativeLines="$(echo "$nativeLines" | sort -u)" \
-	&& if ! echo "$nativeLines" | grep -E 'INFO: Loaded( APR based)? Apache Tomcat Native library' >&2; then \
+RUN set -eux; \
+	nativeLines="$(catalina.sh configtest 2>&1)"; \
+	nativeLines="$(echo "$nativeLines" | grep 'Apache Tomcat Native')"; \
+	nativeLines="$(echo "$nativeLines" | sort -u)"; \
+	if ! echo "$nativeLines" | grep -E 'INFO: Loaded( APR based)? Apache Tomcat Native library' >&2; then \
 		echo >&2 "$nativeLines"; \
 		exit 1; \
 	fi
